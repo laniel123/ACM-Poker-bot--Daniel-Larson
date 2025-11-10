@@ -1,3 +1,12 @@
 
 2000 hands against 3 bots of itslef. 
-#python3 simulate_acm.py --bots bot.py bot.py bot.py --hands 2000 
+
+python3 simulate_acm.py --bots bot.py bot.py bot.py --hands 2000 
+
+python3 simulate_acm.py --bots bot.py randbot.py --hands 5000
+
+python3 simulate_acm.py --bots bot.py nitbot.py fishbot.py --hands 5000
+
+python3 simulate_acm.py --bots bot.py lagbot.py --hands 5000
+
+python3 simulate_acm.py --bots bot.py randbot.py nitbot.py lagbot.py fishbot.py --hands 8000
