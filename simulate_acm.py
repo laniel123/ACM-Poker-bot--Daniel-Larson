@@ -559,3 +559,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+    
+    
+#python3 simulate_acm.py --bots bot.py bot.py bot.py --hands 2000 

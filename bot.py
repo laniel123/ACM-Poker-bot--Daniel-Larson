@@ -1,414 +1,277 @@
-# === ACM.Dev Mann vs Machine — One-File Poker Bot (Hybrid Strategy D, Per-Hand Profiling, Option B Snap) ===
-# Compliant: one file, Python 3.11 + numpy only, entrypoint bet(state)->int, ≤5s per turn.
-# Uses only the helper-style APIs defined below (amount_to_call, get_best_hand_from, legal_actions, etc.).
-# No I/O, no disallowed imports, no cross-hand persistence.
+# ACM.Dev Mann vs Machine — Balanced Exploit Bot (single file)
+# - Conservative→Balanced TAG with position & stack awareness
+# - Short-stack push/fold (~Nash-ish) + late-position steals
+# - Postflop Monte Carlo equity with pot-odds gating & c-bets
+# - Min-raise safe, integer actions, no external libs beyond numpy
+# - No prints, no global I/O. Works in engines that pass a dict GameState.
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, List, Tuple
+from typing import List, Tuple
 import numpy as np
 
-if TYPE_CHECKING:
-    # Types imported for static checking only (the engine defines them)
-    from bot import GameState, Pot
+# --------------------------
+# Helpers over GameState-like dict
+# --------------------------
 
-# -------------------------------------------------------------------------
-# Helper Functions (merged into this single file as requested)
-# -------------------------------------------------------------------------
-
-def get_player_list(state: GameState) -> list[str]:
-    return state.players
-
-def amount_to_call(state: GameState) -> int:
-    current_bet = max(state.bet_money) if state.bet_money else 0
-    player_bet = state.bet_money[state.index_to_action] if state.bet_money else 0
-    return max(0, current_bet - max(0, player_bet))
-
-def get_my_pots(state: GameState) -> list[Pot]:
-    my_index = state.index_to_action
-    my_id = state.players[my_index]
-    my_pots = []
-    for pot in state.pots:
-        try:
-            if my_id in pot.players:
-                my_pots.append(pot)
-        except Exception:
-            # if Pot is dict-like
-            if my_id in pot.get("players", []):
-                my_pots.append(pot)
-    return my_pots
-
-# --- Card parsing + mapping ---
-
-_RANK_TO_INT = {'2': 2, '3': 3, '4': 4, '5': 5, '6': 6, '7': 7, '8': 8, '9': 9,
-                't': 10, 'j': 11, 'q': 12, 'k': 13, 'a': 14}
-_INT_TO_RANK = {v: k for k, v in _RANK_TO_INT.items()}
-_VALID_SUITS = {'s','h','d','c'}
-
-def parse_card(card: str) -> tuple[int, str]:
-    if len(card) != 2:
-        raise ValueError(f"Invalid card string: {card}")
-    r = card[0].lower()
-    s = card[1].lower()
-    if r not in _RANK_TO_INT:
-        raise ValueError(f"Invalid rank: {r}")
-    if s not in _VALID_SUITS:
-        raise ValueError(f"Invalid suit: {s}")
-    return (_RANK_TO_INT[r], s)
-
-def _is_straight_from_unique_desc(ranks_desc_unique: list[int]) -> int:
-    # returns high-card of straight if any, else 0; supports wheel A-2-3-4-5
-    if not ranks_desc_unique:
-        return 0
-    ranks_set = set(ranks_desc_unique)
-    # Try normal straights
-    mx = max(ranks_set)
-    mn = min(ranks_set)
-    for high in range(mx, 4, -1):
-        if all((high - i) in ranks_set for i in range(5)):
-            return high
-    # Wheel
-    if {14, 5, 4, 3, 2}.issubset(ranks_set):
-        return 5
-    return 0
-
-def _evaluate_five(cards5: list[str]) -> tuple[int, list[int]]:
-    """
-    Evaluate exactly 5 cards.
-    Returns (category, kickers) with 0..8 categories like standard:
-      8: Straight Flush
-      7: Four of a Kind
-      6: Full House
-      5: Flush
-      4: Straight
-      3: Three of a Kind
-      2: Two Pair
-      1: One Pair
-      0: High Card
-    Tiebreakers follow standard descending values.
-    """
-    parsed = [parse_card(c) for c in cards5]
-    ranks = sorted((r for r, _ in parsed), reverse=True)
-    suits = [s for _, s in parsed]
-
-    from collections import Counter
-    cnt = Counter(ranks)
-    counts = sorted(((count, rank) for rank, count in cnt.items()), reverse=True)
-    is_flush = len(set(suits)) == 1
-    unique_desc = sorted(set(ranks), reverse=True)
-    straight_high = _is_straight_from_unique_desc(unique_desc)
-
-    # Straight flush
-    if is_flush and straight_high:
-        return (8, [straight_high])
-    # Four of a kind
-    if counts[0][0] == 4:
-        four_rank = counts[0][1]
-        kicker = max(r for r in ranks if r != four_rank)
-        return (7, [four_rank, kicker])
-    # Full house
-    if counts[0][0] == 3 and len(counts) > 1 and counts[1][0] >= 2:
-        three_rank = counts[0][1]
-        pair_rank = counts[1][1]
-        return (6, [three_rank, pair_rank])
-    # Flush
-    if is_flush:
-        return (5, ranks)
-    # Straight
-    if straight_high:
-        return (4, [straight_high])
-    # Trips
-    if counts[0][0] == 3:
-        three_rank = counts[0][1]
-        kickers = sorted((r for r in ranks if r != three_rank), reverse=True)
-        return (3, [three_rank] + kickers)
-    # Two pair
-    if counts[0][0] == 2 and len(counts) > 1 and counts[1][0] == 2:
-        high_pair = max(counts[0][1], counts[1][1])
-        low_pair = min(counts[0][1], counts[1][1])
-        kicker = max(r for r in ranks if r != high_pair and r != low_pair)
-        return (2, [high_pair, low_pair, kicker])
-    # One pair
-    if counts[0][0] == 2:
-        pair_rank = counts[0][1]
-        kickers = sorted((r for r in ranks if r != pair_rank), reverse=True)
-        return (1, [pair_rank] + kickers)
-    # High card
-    return (0, ranks)
-
-def get_best_hand_from(hand: list[str], community: list[str]) -> tuple[int, list[str]]:
-    """
-    Returns (category, best_five_cards_as_str).
-    """
-    if not isinstance(hand, list) or not isinstance(community, list):
-        raise TypeError("hand and community must be lists of card strings")
-    if len(hand) > 2:
-        raise ValueError("hand should contain at most 2 cards")
-
-    from itertools import combinations
-    cards = list(hand) + list(community)
-    best = (-1, [])
-    best_five = None
-    for combo in combinations(cards, 5):
-        val = _evaluate_five(list(combo))
-        if val > best:
-            best = val
-            best_five = combo
-    if best[0] < 0 or best_five is None:
-        return (-1, [])
-    return (best[0], list(best_five))
-
-def fold() -> int:
-    return -1
-
-def check() -> int:
-    return 0
-
-def call(state: GameState) -> int:
-    return amount_to_call(state)
-
-def all_in(state: GameState) -> int:
-    my_index = state.index_to_action
-    return max(0, int(state.held_money[my_index]))
-
-def min_raise(state: GameState) -> int:
-    current_bet = max(state.bet_money) if state.bet_money else 0
-    my_index = state.index_to_action
-    my_bet = state.bet_money[my_index] if state.bet_money else 0
-    # lower active bets (exclude folds)
-    lower_bets = [b for b in state.bet_money if 0 <= b < current_bet]
-    if lower_bets:
-        prev_max = max(lower_bets)
-        previous_raise = current_bet - prev_max
-    else:
-        previous_raise = state.big_blind
-    min_raise_size = max(previous_raise, state.big_blind)
-    target_total_bet = current_bet + min_raise_size
-    return max(0, target_total_bet - my_bet)
-
-def is_valid_bet(state: GameState, amount: int) -> bool:
-    my_index = state.index_to_action
-    if amount == -1:
-        return True
-    to_call = amount_to_call(state)
-    current_bet = max(state.bet_money) if state.bet_money else 0
-    my_bet = state.bet_money[my_index] if state.bet_money else 0
-    my_held = state.held_money[my_index] if state.held_money else 0
-
-    if amount == 0:
-        return to_call == 0
-    elif amount < 0:
-        return False
-    else:
-        total_bet = my_bet + amount
-        if total_bet < current_bet:
-            return False
-        if total_bet > my_bet + my_held:
-            return False
-        if total_bet > current_bet:
-            # it's a raise; must meet min raise requirement
-            if amount < min_raise(state):
-                return False
-        return True
-
-def get_round_name(state: GameState) -> str:
-    community_len = len(state.community_cards)
-    if community_len == 0:
-        return "Pre-Flop"
-    elif community_len == 3:
-        return "Flop"
-    elif community_len == 4:
-        return "Turn"
-    elif community_len == 5:
-        return "River"
-    else:
-        return "Unknown Round"
-
-def my_stack(state: GameState) -> int:
-    my_index = state.index_to_action
-    return int(state.held_money[my_index])
-
-def opp_stacks(state: GameState) -> dict[int, int]:
-    my_index = state.index_to_action
-    return {i: int(state.held_money[i]) for i in range(len(state.players)) if i != my_index}
-
-def legal_actions(state: GameState) -> list[int]:
-    actions = []
-    for amount in [-1, 0, amount_to_call(state), min_raise(state), all_in(state)]:
-        if is_valid_bet(state, amount) and amount not in actions:
-            actions.append(amount)
-    return actions
-
-def total_pot(state: GameState) -> int:
-    try:
-        return int(sum(int(p.value) for p in state.pots))
-    except Exception:
-        return int(sum(int(p.get("value", 0)) for p in state.pots))
-
-def _normalize_card_code(cs: str) -> str:
-    # to lowercase 'rank' + 'suit' (e.g., 'As'/'AS'/'as' -> 'as')
-    return cs[0].lower() + cs[1].lower()
-
-def deck_remaining(state: GameState) -> list[tuple[int, str]]:
-    """
-    Robust deck builder that tolerates mixed-case input from engine.
-    Returns list of (rank:int, suit:str) for undealt cards.
-    """
-    all_ranks = ['2','3','4','5','6','7','8','9','t','j','q','k','a']
-    all_suits = ['s','h','d','c']
-    full_deck = {r+s for r in all_ranks for s in all_suits}
-
-    dealt = set()
-    for c in state.player_cards:
-        if c:
-            dealt.add(_normalize_card_code(c))
-    for c in state.community_cards:
-        if c:
-            dealt.add(_normalize_card_code(c))
-
-    remaining = full_deck - dealt
-    out: list[tuple[int,str]] = []
-    for cs in remaining:
-        r, s = parse_card(cs)
-        out.append((r, s))
-    return out
-
-# -------------------------------------------------------------------------
-# Small utilities for policy
-# -------------------------------------------------------------------------
-
-def _active_player_indexes(bet_money: List[int]) -> List[int]:
+def active_player_indexes(bet_money: List[int]) -> List[int]:
     return [i for i, b in enumerate(bet_money) if b >= 0]
 
-def _current_max_bet(bet_money: List[int]) -> int:
+def current_max_bet(bet_money: List[int]) -> int:
     act = [b for b in bet_money if b >= 0]
     return max(act) if act else 0
 
-def _num_live_opponents(state: GameState) -> int:
-    me = state.index_to_action
-    return max(0, len(_active_player_indexes(state.bet_money)) - (1 if state.bet_money[me] >= 0 else 0))
+def amount_to_call(state) -> int:
+    mx = current_max_bet(state["bet_money"])
+    my = state["bet_money"][state["index_to_action"]]
+    return max(0, mx - max(0, my))
 
-def _position_index(state: GameState) -> int:
-    # distance from SB; later seats have larger values (rough heuristic)
-    n = len(state.players)
-    return (state.index_to_action - state.index_of_small_blind) % max(1, n)
+def can_check(state) -> bool:
+    return amount_to_call(state) == 0
 
-def _board_texture_flags(board: List[str]) -> tuple[bool,bool,bool]:
-    """Return (flushy, straighty, paired)."""
-    if not board:
-        return (False, False, False)
-    parsed = [parse_card(c) for c in board]
-    # flushy?
-    suit_counts = {}
-    for _, s in parsed:
-        suit_counts[s] = suit_counts.get(s, 0) + 1
-    flushy = any(c >= 3 for c in suit_counts.values())
-    # straighty?
-    uniq = sorted(set(v for v,_ in parsed), reverse=True)
-    straighty = (len(uniq) >= 4 and (uniq[0] - uniq[-1] <= 6))
-    # paired?
-    val_counts = {}
-    for v,_ in parsed:
-        val_counts[v] = val_counts.get(v, 0) + 1
-    paired = any(c >= 2 for c in val_counts.values())
-    return (flushy, straighty, paired)
+def my_stack(state) -> int:
+    return int(state["held_money"][state["index_to_action"]])
 
-def _per_hand_aggression(state: GameState) -> float:
-    mx = _current_max_bet(state.bet_money)
-    me = state.index_to_action
-    opps = [i for i,b in enumerate(state.bet_money) if i != me and b >= 0]
-    if not opps:
-        return 0.0
-    hi = sum(1 for i in opps if state.bet_money[i] >= max(1, mx // 2))
-    return hi / len(opps)
+def live_opponents(state) -> int:
+    return max(0, len(active_player_indexes(state["bet_money"])) - 1)
 
-def _per_hand_passivity(state: GameState) -> float:
-    me = state.index_to_action
-    opps = [i for i,b in enumerate(state.bet_money) if i != me and b >= 0]
-    if not opps:
-        return 0.0
-    mx = _current_max_bet(state.bet_money)
-    checks_or_behind = 0
-    for i in opps:
-        b = state.bet_money[i]
-        if b == 0 or (mx > 0 and b < mx):
-            checks_or_behind += 1
-    return checks_or_behind / len(opps)
+def estimated_pot_value(state) -> int:
+    pots = state.get("pots", [])
+    try:
+        ps = sum(int(p.get("value", 0)) for p in pots)
+    except Exception:
+        ps = 0
+    # Some engines don't finalize pot into pots[] until showdown → fallback:
+    return max(ps, sum(max(0, b) for b in state["bet_money"]))
 
-# -------------------------------------------------------------------------
-# Equity: Monte Carlo using deck_remaining + get_best_hand_from
-# -------------------------------------------------------------------------
+def my_position(state) -> int:
+    # Rough relative seat index (later number -> later position)
+    return (int(state["index_to_action"]) - int(state["index_of_small_blind"])) % len(state["players"])
 
-def _card_tuple_to_str(rank: int, suit: str) -> str:
-    return _INT_TO_RANK[rank] + suit
-
-def estimate_equity_mc(state: GameState, iterations: int = 280) -> float:
+def min_raise(state) -> int:
     """
-    Estimate our equity vs live opponents using Monte Carlo.
-    Uses helpers:
-      - deck_remaining(state)  -> remaining cards as (rank, suit)
-      - get_best_hand_from()   -> best 5-card selection
+    Minimum *amount to put in this action* to complete a legal raise
+    relative to my current committed chips this street.
     """
-    rng = np.random.default_rng()
+    bets = state["bet_money"]
+    current_bet = current_max_bet(bets)
+    my_idx = state["index_to_action"]
+    my_bet = max(0, int(bets[my_idx]))
+    # Highest lower bet among active players:
+    lowers = [b for b in bets if 0 <= b < current_bet]
+    if lowers:
+        prev_max = max(lowers)
+        last_raise = current_bet - prev_max
+    else:
+        last_raise = int(state["big_blind"])
+    min_raise_size = max(last_raise, int(state["big_blind"]))
+    target_total = current_bet + min_raise_size
+    return max(0, target_total - my_bet)
 
-    # Known cards (normalize to lower-case)
-    hole = list(state.player_cards[:2])
-    board = list(state.community_cards)
-    known_set = {_normalize_card_code(c) for c in hole if c} | {_normalize_card_code(c) for c in board if c}
+def legalize_amount(state, amount: int) -> int:
+    """Clamp to a legal action in {-1, 0, call, min_raise..all_in}."""
+    if amount == -1:
+        return -1
+    to_call = amount_to_call(state)
+    my_idx = state["index_to_action"]
+    my_bet = max(0, int(state["bet_money"][my_idx]))
+    my_hold = int(state["held_money"][my_idx])
+    current_b = current_max_bet(state["bet_money"])
 
-    # Build deck from helper (tuples) -> strings 'rs'
-    rem_tuples = deck_remaining(state)
-    deck = np.array([_card_tuple_to_str(r, s) for (r, s) in rem_tuples], dtype=object)
+    if amount == 0:
+        return 0 if to_call == 0 else to_call
 
-    live_opp = _num_live_opponents(state)
-    if live_opp <= 0:
-        # heads-up vs nobody (shouldn't happen), count as full equity
-        return 1.0
+    if amount < 0:
+        return -1
 
-    # how many community to draw
-    need_board = max(0, 5 - len(board))
+    # Interpret "amount" as the chips we add now (engine convention)
+    add = int(amount)
+    total_post = my_bet + add
 
-    wins = 0
-    ties = 0
-    total = 0
+    # All-in allowed
+    if add >= my_hold:
+        return my_hold
 
-    for _ in range(iterations):
-        draw_cnt = 2 * live_opp + need_board
-        if draw_cnt > len(deck):
+    # Calls must reach current bet
+    if total_post < current_b:
+        return max(0, to_call)
+
+    # Raise case: total_post > current_b
+    # Must be >= min-raise
+    need_min = min_raise(state)
+    if add < need_min:
+        # If we intended a raise but it's too small, default to call
+        return max(0, to_call)
+    return add
+
+# --------------------------
+# Cards & Hand Evaluator (5/7)
+# --------------------------
+
+_RANK_MAP = {'2':2,'3':3,'4':4,'5':5,'6':6,'7':7,'8':8,'9':9,'t':10,'j':11,'q':12,'k':13,'a':14}
+_SUITS = ('s','h','d','c')
+_VAL_ORDER = '23456789tjqka'
+
+def parse_card(cs: str) -> Tuple[int,str]:
+    r, s = cs[0].lower(), cs[1].lower()
+    return _RANK_MAP[r], s
+
+def _is_straight(sorted_desc_vals: List[int]) -> Tuple[bool,int]:
+    seen = []
+    last = None
+    for v in sorted_desc_vals:
+        if v != last:
+            seen.append(v)
+            last = v
+    if 14 in seen:
+        seen.append(1)
+    run = 1
+    best = 0
+    for i in range(1, len(seen)):
+        if seen[i-1] - 1 == seen[i]:
+            run += 1
+            if run >= 5:
+                best = max(best, seen[i-4])
+        else:
+            run = 1
+    return (best > 0, best)
+
+def hand_rank_7(cards: List[Tuple[int,str]]) -> Tuple[int,List[int]]:
+    vals = [v for v,_ in cards]
+    suits = [s for _,s in cards]
+    vals_sorted = sorted(vals, reverse=True)
+
+    # suit buckets
+    suit_map = {}
+    for v,s in cards:
+        suit_map.setdefault(s, []).append(v)
+    flush_suit = None
+    flush_vals = None
+    for s, vs in suit_map.items():
+        if len(vs) >= 5:
+            flush_suit = s
+            flush_vals = sorted(vs, reverse=True)
             break
-        idx = rng.choice(len(deck), size=draw_cnt, replace=False)
-        draw = deck[idx]
 
-        # Opponents' hands
-        opp_hands = []
+    # straight flags
+    is_stra, stra_high = _is_straight(vals_sorted)
+    if flush_suit is not None:
+        is_sf, sf_high = _is_straight(sorted(suit_map[flush_suit], reverse=True))
+        if is_sf:
+            return (8, [sf_high])
+
+    # counts
+    cnt = {}
+    for v in vals:
+        cnt[v] = cnt.get(v,0)+1
+    by_count = {}
+    for v,c in cnt.items():
+        by_count.setdefault(c, []).append(v)
+    for c in by_count:
+        by_count[c].sort(reverse=True)
+
+    if 4 in by_count:
+        quad = by_count[4][0]
+        kick = [x for x in vals_sorted if x != quad][0]
+        return (7, [quad, kick])
+
+    trips = by_count.get(3, [])
+    pairs = by_count.get(2, [])
+    if trips:
+        t = trips[0]
+        if len(trips) > 1:
+            return (6, [t, trips[1]])
+        if pairs:
+            return (6, [t, pairs[0]])
+
+    if flush_suit is not None:
+        return (5, flush_vals[:5])
+
+    if is_stra:
+        return (4, [stra_high])
+
+    if trips:
+        t = trips[0]
+        kicks = [x for x in vals_sorted if x != t][:2]
+        return (3, [t] + kicks)
+
+    if len(pairs) >= 2:
+        p1, p2 = pairs[:2]
+        hp, lp = max(p1,p2), min(p1,p2)
+        kick = [x for x in vals_sorted if x != hp and x != lp][0]
+        return (2, [hp, lp, kick])
+
+    if len(pairs) == 1:
+        p = pairs[0]
+        kicks = [x for x in vals_sorted if x != p][:3]
+        return (1, [p] + kicks)
+
+    return (0, vals_sorted[:5])
+
+def compare_rank(a: Tuple[int,List[int]], b: Tuple[int,List[int]]) -> int:
+    if a[0] != b[0]:
+        return 1 if a[0] > b[0] else -1
+    la, lb = a[1], b[1]
+    for x, y in zip(la, lb):
+        if x != y:
+            return 1 if x > y else -1
+    if len(la) != len(lb):
+        return 1 if len(la) > len(lb) else -1
+    return 0
+
+# --------------------------
+# Monte Carlo Equity
+# --------------------------
+
+def deck_minus(known: List[str]) -> List[Tuple[int,str]]:
+    known_set = set(c.lower() for c in known)
+    deck = []
+    for r in _VAL_ORDER:
+        for s in _SUITS:
+            cs = f"{r}{s}"
+            if cs in known_set:
+                continue
+            deck.append(parse_card(cs))
+    return deck
+
+def estimate_equity(hole: List[str], board: List[str], num_opps: int, iters: int, rng: np.random.Generator) -> float:
+    known = list(hole) + list(board)
+    deck = deck_minus(known)
+    if not deck:
+        return 0.0
+    our_hole = [parse_card(c) for c in hole]
+    board_parsed = [parse_card(c) for c in board]
+    need_board = max(0, 5 - len(board_parsed))
+
+    wins = ties = total = 0
+    deck_arr = np.array(deck, dtype=object)
+
+    for _ in range(iters):
+        draw_need = 2*num_opps + need_board
+        if draw_need > len(deck_arr):
+            break
+        idx = rng.choice(len(deck_arr), size=draw_need, replace=False)
+        draw = deck_arr[idx]
         ptr = 0
-        for _i in range(live_opp):
-            opp_hands.append([draw[ptr], draw[ptr+1]])
-            ptr += 2
-
-        # Fill board
-        sim_board = list(board)
-        for _j in range(need_board):
+        opps = []
+        for _o in range(num_opps):
+            opps.append([draw[ptr], draw[ptr+1]]); ptr += 2
+        sim_board = list(board_parsed)
+        for _ in range(need_board):
             sim_board.append(draw[ptr]); ptr += 1
 
-        # Our best 5 and category
-        our_cat, our5 = get_best_hand_from(hole, sim_board)
-        our_val = _evaluate_five(our5)
+        our7 = our_hole + sim_board
+        our_rank = hand_rank_7(our7)
 
         better = False
         equal = 0
-        for oh in opp_hands:
-            cat, best5 = get_best_hand_from(oh, sim_board)
-            val = _evaluate_five(best5)
-            if val > our_val:
-                better = True
-                equal = 0
-                break
-            elif val == our_val:
+        for oh in opps:
+            their = list(oh) + sim_board
+            cmpv = compare_rank(our_rank, hand_rank_7(their))
+            if cmpv < 0:
+                better = True; equal = 0; break
+            elif cmpv == 0:
                 equal += 1
-
-        if better:
-            pass
-        else:
+        if not better:
             if equal > 0:
                 ties += 1
             else:
@@ -417,199 +280,256 @@ def estimate_equity_mc(state: GameState, iterations: int = 280) -> float:
 
     if total == 0:
         return 0.0
-    return (wins + 0.5 * ties) / total
+    return (wins + 0.5*ties) / total
 
-# -------------------------------------------------------------------------
-# Preflop tiers (position-aware) — conservative → balanced
-# -------------------------------------------------------------------------
+# --------------------------
+# Preflop tiers & push/fold
+# --------------------------
 
-def _preflop_tier(hole: list[str], pos: int, n_players: int) -> str:
-    """
-    Returns 'premium' | 'strong' | 'medium' | 'trash'.
-    Slightly looser in late position.
-    """
-    if len(hole) < 2:
-        return 'trash'
-    a, b = hole[0], hole[1]
+def preflop_tier(hole: List[str]) -> str:
+    a, b = hole
     va, sa = parse_card(a)
     vb, sb = parse_card(b)
     vhi, vlo = max(va, vb), min(va, vb)
     suited = (sa == sb)
     gap = vhi - vlo
-    late = (pos >= n_players - 2)
 
     # Pairs
     if va == vb:
-        if vhi >= 13:   # AA, KK
-            return 'premium'
-        if vhi >= 11:   # QQ, JJ
-            return 'strong'
-        if vhi >= 8:    # TT, 99, 88
-            return 'medium'
-        return 'medium' if late else 'trash'
+        if vhi >= 13: return 'premium'   # AA, KK
+        if vhi >= 11: return 'strong'    # QQ, JJ
+        if vhi >= 8:  return 'medium'    # TT-88
+        return 'medium'                  # 77-22 set-mine
 
-    # Broadways / Ax
-    if vhi >= 13 and vlo >= 10:  # KQ/KJ/QJ
-        return 'strong' if suited or late else 'medium'
-    if vhi == 14:  # Ax
-        if suited and vlo >= 10:        # ATs+
-            return 'strong'
-        if vlo >= 13:                    # AK offsuit
-            return 'strong'
-        if suited and (vlo >= 6 or late):
-            return 'medium'
-        if vlo >= 10:
-            return 'medium' if late else 'trash'
-        return 'trash' if not late else 'medium'
+    # Broadways & Ax
+    if vhi >= 13 and vlo >= 10:             # KQ/KJ/QJ+
+        return 'strong' if suited else 'medium'
+    if vhi == 14:                            # Ax
+        if suited and vlo >= 10:  return 'strong'   # ATs+
+        if vlo >= 13:             return 'strong'   # AKo
+        if suited and vlo >= 6:   return 'medium'   # A9s-A6s
+        if vlo >= 10:             return 'medium'   # AQo-AJo-ATo
+        return 'trash'
 
-    # Suited connectors/gappers (late)
-    if suited and gap <= 3 and vhi >= 9 and (vlo >= 5 or late):
+    # Suited connectors/gappers
+    if suited and gap <= 3 and vhi >= 10 and vlo >= 6:
         return 'medium'
-    if suited and late and gap <= 4 and vhi >= 8 and vlo >= 5:
+    if suited and gap <= 2 and vhi >= 9 and vlo >= 5:
         return 'medium'
-
     return 'trash'
 
-# -------------------------------------------------------------------------
-# Option-B bet snapping (pick the largest legal action ≤ target)
-# -------------------------------------------------------------------------
-
-def _snap_to_legal_option_b(state: GameState, target: int) -> int:
+def pushfold_should_shove(hole: List[str], eff_bb: float, late_pos: bool) -> bool:
     """
-    Given a desired 'target' chip amount for THIS action, return the largest legal action
-    that does not exceed 'target'. If none exist ≤ target, return 0 (check) if legal,
-    else fold().
+    Simple ~Nash-ish shove thresholds:
+      - <=5BB: 22+, A2+, K9s+, QTs+, JTs, KTo+, QJo (late expands a bit)
+      - <=8BB: 22+, A2s+, A7o+, KTs+, QTs+, JTs, KQo (late expands: add K9o, T9s)
     """
-    acts = legal_actions(state)
-    # exact match first
-    if target in acts:
-        return target
-    # collect numeric actions ≥ 0 and ≤ target
-    leq = [a for a in acts if a >= 0 and a <= target]
-    if leq:
-        return max(leq)
-    # if we can check, do it
-    if 0 in acts:
-        return 0
-    # otherwise fold safely
-    return -1
+    a, b = hole
+    va, sa = parse_card(a)
+    vb, sb = parse_card(b)
+    suited = (sa == sb)
+    vhi, vlo = max(va, vb), min(va, vb)
+    pair = (va == vb)
 
-# -------------------------------------------------------------------------
-# Core Decision Policy (Hybrid Strategy D)
-# -------------------------------------------------------------------------
+    def is_ax(): return (vhi == 14)
+    def is_kx(): return (vhi == 13)
+    def offs():  return not suited
 
-def _decide(state: GameState) -> int:
-    idx = state.index_to_action
-    bb = int(state.big_blind)
-    n_players = len(state.players)
-    hole = list(state.player_cards[:2])
-    board = list(state.community_cards)
-    pot_val = max(total_pot(state), sum(max(0, b) for b in state.bet_money))
-    pos = _position_index(state)
-    live_opp = _num_live_opponents(state)
-    call_amt = amount_to_call(state)
-    can_check = (call_amt == 0)
-    rng = np.random.default_rng()
+    if eff_bb <= 5.5:
+        if pair: return True
+        if is_ax(): return True
+        if is_kx() and ( (suited and vlo >= 9) or (offs() and vlo >= 10) ):
+            return True
+        # QTs+, JTs
+        if suited and ((vhi==12 and vlo>=10) or (vhi==11 and vlo==10)):
+            return True
+        if late_pos and suited and vhi>=10 and (vhi - vlo)<=3:
+            return True
+        return False
 
-    # Per-street opponent reads + board texture
-    opp_aggr = _per_hand_aggression(state)
-    opp_pass = _per_hand_passivity(state)
-    flushy, straighty, paired = _board_texture_flags(board)
+    if eff_bb <= 8.5:
+        if pair: return True
+        if is_ax():
+            if suited: return True
+            return vlo >= 7  # A7o+
+        if vhi==13:  # Kx
+            if suited and vlo>=10: return True
+        if suited and ((vhi==12 and vlo>=10) or (vhi==11 and vlo==10)):  # QTs+, JTs
+            return True
+        if (vhi==13 and vlo==12 and offs()):  # KQo
+            return True
+        if late_pos:
+            if (vhi==13 and vlo>=9 and offs()):  # K9o+
+                return True
+            if suited and vhi>=10 and (vhi - vlo)<=3:  # T9s, 98s, etc.
+                return True
+        return False
 
-    # Safety: if we can't afford call, fold
-    if call_amt > my_stack(state):
-        return fold()
+    return False
+
+# --------------------------
+# Core decision policy
+# --------------------------
+
+def decide_action(state) -> int:
+    idx = int(state["index_to_action"])
+    bb = int(state["big_blind"])
+    players: List[str] = state["players"]
+    bet_money: List[int] = [int(x) for x in state["bet_money"]]
+    held_money: List[int] = [int(x) for x in state["held_money"]]
+    hole = list(state["player_cards"])[:2]
+    board = list(state.get("community_cards", []))
+    n = len(players)
+
+    # Per-turn RNG seeded from our private info to avoid synchronized behavior
+    seed_basis = hash((tuple(hole), tuple(board), idx, int(sum(bet_money))))
+    rng = np.random.default_rng(np.int64(seed_basis & 0xFFFFFFFF))
+
+    # Context
+    to_call = amount_to_call(state)
+    can_chk = (to_call == 0)
+    live_opp = live_opponents(state)
+    pos = my_position(state)
+    pot = estimated_pot_value(state)
+    my_bank = my_stack(state)
+
+    # If cannot afford call, fold
+    if to_call > my_bank:
+        return -1
 
     preflop = (len(board) == 0)
 
-    # ---------------- PRE-FLOP ----------------
+    # Effective stack in BB (vs biggest live opp)
+    opp_max = 0
+    for i in range(n):
+        if i == idx: continue
+        if bet_money[i] >= 0:
+            opp_max = max(opp_max, held_money[i])
+    eff_stack = min(my_bank, opp_max) if opp_max > 0 else my_bank
+    eff_bb = eff_stack / max(1, bb)
+    late_pos = (pos >= n-2)  # last two seats are "late"
+
+    # -------- PRE-FLOP --------
     if preflop:
-        tier = _preflop_tier(hole, pos, n_players)
+        tier = preflop_tier(hole)
+        unopened = (current_max_bet(bet_money) == 0)
 
-        if not can_check:
-            if tier in ('premium', 'strong'):
-                return call(state)
+        # Short-stack push/fold
+        if eff_bb <= 8.5:
+            if pushfold_should_shove(hole, eff_bb, late_pos):
+                # Shove if unopened or versus raise if call is non-trivial
+                # Otherwise take the free check when allowed (in BB)
+                if unopened and can_chk:
+                    # allow a steal attempt: small open to 2.5-3bb
+                    open_mult = 3.0 if rng.random() < 0.6 else 2.5
+                    amt = int(max(bb, round(open_mult * bb)))
+                    return legalize_amount(state, min(amt, my_bank))
+                # prefer shove over flatting short
+                return legalize_amount(state, my_bank)
+            else:
+                # If short and weak: fold to raises, check BB when free
+                return 0 if can_chk else -1
+
+        # Normal stacks:
+        if unopened and can_chk:
+            # Opening ranges by tier + position
+            if tier == 'premium':
+                open_mult = 3.0 if rng.random() < 0.6 else 2.5
+                amt = int(max(bb, round(open_mult * bb)))
+                return legalize_amount(state, min(amt, my_bank))
+            if tier == 'strong':
+                open_mult = 2.5 if rng.random() < 0.7 else 2.0
+                amt = int(max(bb, round(open_mult * bb)))
+                # late-position steal widen
+                if late_pos and rng.random() < 0.25:
+                    amt = int(max(bb, round(3.0 * bb)))
+                return legalize_amount(state, min(amt, my_bank))
             if tier == 'medium':
-                cheap = call_amt <= max(bb, pot_val // 8)
-                late_bonus = (pos >= n_players - 2) and (call_amt <= 3*bb)
-                return call(state) if (cheap or late_bonus) else fold()
-            return fold()
+                # LP steal sometimes
+                if late_pos and rng.random() < 0.30:
+                    amt = int(max(bb, round(2.0 * bb)))
+                    return legalize_amount(state, min(amt, my_bank))
+                return 0
+            return 0
 
-        # We can open
-        if tier == 'premium':
-            base = 3.2 if rng.random() < 0.5 else 2.8
-            target = int(max(bb, round(base * bb)))
-            return _snap_to_legal_option_b(state, target)
-        elif tier == 'strong':
-            base = 2.7 if rng.random() < 0.6 else 2.3
-            if pos >= n_players - 2 and rng.random() < 0.25:
-                base += 0.4
-            target = int(max(bb, round(base * bb)))
-            return _snap_to_legal_option_b(state, target)
-        elif tier == 'medium':
-            open_freq = 0.12 + 0.10 * (1.0 if pos >= n_players - 2 else 0.0)
-            if rng.random() < open_freq:
-                target = int(max(bb, round(2.0 * bb)))
-                return _snap_to_legal_option_b(state, target)
-            return check()
-        else:
-            return check()
+        # Facing raise preflop:
+        if not can_chk:
+            if tier in ('premium','strong'):
+                # Mostly call; occasional re-raise when deep and late
+                if eff_bb >= 25 and late_pos and rng.random() < 0.20:
+                    # min-raise (safe) or small 3-bet ~3x open
+                    r_amt = max(min_raise(state), int(3.0 * bb))
+                    r_amt = min(r_amt, my_bank)
+                    return legalize_amount(state, r_amt)
+                return legalize_amount(state, to_call)
+            if tier == 'medium':
+                # Peel if price is cheap (<= ~12.5% pot or <= 2.5bb)
+                cheap = (to_call <= max(bb*2.5, max(bb, pot//8)))
+                return legalize_amount(state, to_call) if cheap else -1
+            return -1
 
-    # --------------- POST-FLOP & LATER ---------------
-    # Monte Carlo equity vs live opponents
-    base_iters = 300
+    # -------- POST-FLOP+ --------
+    # Fast equity estimate
+    base_iters = 260
     iters = int(max(140, base_iters - 40 * max(0, live_opp - 1)))
-    equity = estimate_equity_mc(state, iterations=iters)
+    equity = estimate_equity(hole, board, max(1, live_opp), iters, rng)
 
-    if not can_check:
-        # facing a bet
-        eff_pot = pot_val + call_amt
-        pot_odds = (call_amt / eff_pot) if eff_pot > 0 else 1.0
-        board_scary = (flushy and straighty) or (paired and (flushy or straighty))
-        slack = 0.035 + (0.02 if board_scary else 0.0) - (0.01 * min(1.0, opp_pass))
+    # Texture flags
+    parsed_board = [parse_card(c) for c in board]
+    suit_counts = {}
+    for _, s in parsed_board:
+        suit_counts[s] = suit_counts.get(s, 0) + 1
+    flushed = any(c >= 4 for c in suit_counts.values())
+    uniq = sorted(set(v for v,_ in parsed_board), reverse=True)
+    straighty = (len(uniq) >= 4 and (uniq[0] - uniq[-1] <= 6))
 
-        if equity >= pot_odds + slack:
-            return call(state)
-        else:
-            # rare semi-continue when cheap + fold equity (passive opps)
-            semi_window = (not paired) and (flushy or straighty)
-            if semi_window and call_amt <= 2*bb and rng.random() < (0.06 + 0.04*max(0.0, opp_pass - 0.5)):
-                return call(state)
-            return fold()
+    # Facing a bet → pot-odds gate
+    if not can_chk:
+        eff_pot = pot + to_call
+        pot_odds = (to_call / eff_pot) if eff_pot > 0 else 1.0
 
-    # We can bet
-    pot_proxy = max(pot_val, 4*bb)
-    value_hi = 0.72 - 0.03 * min(1.0, opp_pass)     # bet thinner vs passive
-    value_mid = 0.56 - 0.02 * min(1.0, opp_pass)
+        # Strong: raise sometimes, else call
+        if equity >= max(0.70, pot_odds + 0.08):
+            # Mix in raises but keep it legal and small (min-raise) to avoid rule traps
+            if rng.random() < 0.25:
+                r_amt = min(my_bank, max(min_raise(state), int(0.6 * max(pot, 3*bb))))
+                return legalize_amount(state, r_amt)
+            return legalize_amount(state, to_call)
 
-    if equity >= value_hi:
-        pct = 0.85 if not (paired or flushy) else 0.72
-        if opp_pass > 0.6:
-            pct = max(pct, 0.9)
-        target = int(max(3*bb, round(pct * pot_proxy)))
-        return _snap_to_legal_option_b(state, target)
+        # Medium: call if equity beats price with small buffer
+        if equity >= pot_odds + 0.03:
+            return legalize_amount(state, to_call)
 
-    if equity >= value_mid:
-        pct = 0.55 + (0.05 if pos >= n_players - 2 else 0.0)
-        target = int(max(2*bb, round(pct * pot_proxy)))
-        return _snap_to_legal_option_b(state, target)
+        # Rare semi-bluff if board is dynamic and price small
+        if (not flushed) and straighty and rng.random() < 0.07 and to_call <= my_bank//12:
+            r_amt = min(my_bank, max(min_raise(state), int(0.5 * max(pot, 3*bb))))
+            return legalize_amount(state, r_amt)
 
-    # Bluff / c-bet
-    bluffable = (not paired) and (flushy ^ straighty)  # exactly one pressure vector
-    base_bluff = 0.10 + 0.08 * max(0.0, opp_pass - 0.5) - 0.05 * max(0.0, opp_aggr - 0.3)
-    if bluffable and rng.random() < base_bluff:
-        target = int(max(bb, round(0.4 * pot_proxy)))
-        return _snap_to_legal_option_b(state, target)
+        # Otherwise fold
+        return -1
 
-    return check()
+    # We can bet (no prior bet on this street)
+    if equity >= 0.72:
+        # Value bet ~70-90% pot (fallback to ~3bb if pot small)
+        target = int(max(3*bb, round(0.8 * max(pot, 4*bb))))
+        return legalize_amount(state, min(target, my_bank))
+    elif equity >= 0.55:
+        target = int(max(2*bb, round(0.6 * max(pot, 4*bb))))
+        return legalize_amount(state, min(target, my_bank))
+    else:
+        # Small c-bet on bluffable boards
+        if (not flushed) and straighty and rng.random() < 0.18:
+            target = int(max(bb, round(0.4 * max(pot, 3*bb))))
+            return legalize_amount(state, min(target, my_bank))
+        return 0
 
-# -------------------------------------------------------------------------
-# Public entrypoint required by the tournament engine
-# -------------------------------------------------------------------------
+# --------------------------
+# Public entrypoint
+# --------------------------
 
 def bet(state) -> int:
     try:
-        return int(_decide(state))
+        return int(decide_action(state))
     except Exception:
-        # Fail-safe to never crash the engine
+        # Never crash: safest fallback is fold
         return -1

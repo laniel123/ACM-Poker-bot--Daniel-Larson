@@ -1,0 +1,3 @@
+
+2000 hands against 3 bots of itslef. 
+#python3 simulate_acm.py --bots bot.py bot.py bot.py --hands 2000 
